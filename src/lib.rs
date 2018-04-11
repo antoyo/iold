@@ -38,7 +38,8 @@ use std::ops::{Generator, GeneratorState};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::raw::c_int;
 
-const FD_COUNT: usize = 1024;
+// TODO: create a BitSet and use as a key for a Map<BitSet, Generator>.
+const FD_COUNT: usize = 64;
 
 const EPOLL_CTL_ADD: c_int = 1;
 const EPOLLIN: c_int = 0x1;
@@ -107,6 +108,7 @@ macro_rules! handle_would_block {
 
 pub struct EventLoop {
     events: [epoll_event; FD_COUNT],
+    event_count: usize,
     fd_set: c_int,
 }
 
@@ -114,7 +116,8 @@ impl EventLoop {
     pub fn new() -> Self {
         let fd_set = unsafe { epoll_create1(0) };
         Self {
-            events: unsafe { mem::uninitialized() },
+            events: unsafe { mem::zeroed() },
+            event_count: 0,
             fd_set,
         }
     }
@@ -127,21 +130,24 @@ impl EventLoop {
         unsafe { epoll_ctl(self.fd_set, EPOLL_CTL_ADD, fd, &mut event) };
     }
 
-    pub fn run<G: Generator<Yield=RawFd>>(&self, mut generator: G) -> G::Return {
+    pub fn run<G: Generator<Yield=RawFd>>(&mut self, mut generator: G) -> G::Return {
         loop {
             match unsafe { generator.resume() } {
-                GeneratorState::Yielded(fd) => self.add_fd(fd),
+                GeneratorState::Yielded(fd) => {
+                    self.add_fd(fd);
+                    self.wait().expect("wait");
+                },
                 GeneratorState::Complete(value) => return value,
             }
         }
     }
 
-    pub fn wait(&self) -> Result<(), ()> {
+    pub fn wait(&mut self) -> Result<(), ()> {
         let result = unsafe { epoll_wait(self.fd_set, self.events.as_ptr() as *mut _, FD_COUNT as c_int, -1) };
         if result < 0 {
             Err(())
         } else {
-            //self.event_count = result as usize;
+            self.event_count = result as usize;
             Ok(())
         }
     }
@@ -201,7 +207,7 @@ mod tests {
     #[test]
     fn tcp() {
         thread::spawn(|| {
-            let event_loop = EventLoop::new();
+            let mut event_loop = EventLoop::new();
             event_loop.run(static || {
                 // TODO: should connect be async?
                 let mut stream = TcpStream::connect("127.0.0.1:8080").expect("stream");
@@ -214,7 +220,7 @@ mod tests {
         });
 
         thread::spawn(|| {
-            let event_loop = EventLoop::new();
+            let mut event_loop = EventLoop::new();
             event_loop.run(static || {
                 let mut stream = TcpStream::connect("127.0.0.1:8080").expect("stream");
                 stream.set_nonblocking(true).expect("set nonblocking");
@@ -225,7 +231,7 @@ mod tests {
             });
         });
 
-        let event_loop = EventLoop::new();
+        let mut event_loop = EventLoop::new();
         let listener = TcpListener::bind("127.0.0.1:8080").expect("listener");
         listener.set_nonblocking(true).expect("set nonblocking");
         /*let (client, _address) = {
