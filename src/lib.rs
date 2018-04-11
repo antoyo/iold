@@ -13,7 +13,7 @@ use std::io::{
 use std::io::ErrorKind::WouldBlock;
 use std::mem;
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::ops::Generator;
+use std::ops::{Generator, GeneratorState};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::raw::c_int;
 
@@ -36,12 +36,12 @@ extern "C" {
 
 #[macro_export]
 macro_rules! await {
-    ($event_loop:expr, $async_func:ident ( $($args:expr),* )) => {{
-        let mut generator = $async_func(&$event_loop $(,$args)*);
+    ($async_func:ident ( $($args:expr),* )) => {{
+        let mut generator = $async_func($($args),*);
         let result;
         loop {
             match unsafe { generator.resume() } {
-                GeneratorState::Yielded(_) => { let _ = $event_loop.wait(); },
+                GeneratorState::Yielded(fd) => yield fd,
                 GeneratorState::Complete(value) => {
                     result = value;
                     break;
@@ -54,9 +54,9 @@ macro_rules! await {
 
 #[macro_export]
 macro_rules! async {
-    (pub fn $func_name:ident ( $event_loop:ident, $($arg_names:ident : $(& $arg_types:ident)*),* ) -> $ret_typ:ty $block:block) => {
-        pub fn $func_name<'a>($event_loop: &'a EventLoop, $($arg_names: $(&'a $arg_types)*),*) ->
-            impl Generator<Yield = (), Return = $ret_typ> + 'a
+    (pub fn $func_name:ident ( $($arg_names:ident : $(& $arg_types:ident)*),* ) -> $ret_typ:ty $block:block) => {
+        pub fn $func_name<'a>($($arg_names: $(&'a $arg_types)*),*) ->
+            impl Generator<Yield = RawFd, Return = $ret_typ> + 'a
         {
             move || {
                 $block
@@ -67,13 +67,12 @@ macro_rules! async {
 
 #[macro_export]
 macro_rules! handle_would_block {
-    ($event_loop:expr, $object:ident . $func_name:ident ($($args:expr),*)) => {
+    ($object:ident . $func_name:ident ($($args:expr),*)) => {
         loop {
             match $object.$func_name($($args),*) {
                 Err(error) => {
                     if error.kind() == WouldBlock {
-                        $event_loop.add_fd($object.as_raw_fd());
-                        yield;
+                        yield $object.as_raw_fd();
                     }
                     else {
                         return Err(error);
@@ -105,6 +104,15 @@ impl EventLoop {
             u64: fd as u64,
         };
         unsafe { epoll_ctl(self.fd_set, EPOLL_CTL_ADD, fd, &mut event) };
+    }
+
+    pub fn run<G: Generator<Yield=RawFd>>(&self, mut generator: G) -> G::Return {
+        loop {
+            match unsafe { generator.resume() } {
+                GeneratorState::Yielded(fd) => self.add_fd(fd),
+                GeneratorState::Complete(value) => return value,
+            }
+        }
     }
 
     pub fn wait(&self) -> Result<(), ()> {
@@ -140,24 +148,24 @@ impl EventLoop {
 }*/
 
 async!(
-pub fn accept_async(event_loop, listener: &TcpListener) -> io::Result<(TcpStream, SocketAddr)> {
-    handle_would_block!(event_loop, listener.accept())
+pub fn accept_async(listener: &TcpListener) -> io::Result<(TcpStream, SocketAddr)> {
+    handle_would_block!(listener.accept())
 }
 );
 
-pub fn write_async<'a>(event_loop: &'a EventLoop, stream: &'a mut TcpStream, buf: &'a [u8]) ->
-    impl Generator<Yield = (), Return = io::Result<usize>> + 'a
+pub fn write_async<'a>(stream: &'a mut TcpStream, buf: &'a [u8]) ->
+    impl Generator<Yield = RawFd, Return = io::Result<usize>> + 'a
 {
     move || {
-        handle_would_block!(event_loop, stream.write(buf))
+        handle_would_block!(stream.write(buf))
     }
 }
 
-pub fn read_async<'a>(event_loop: &'a EventLoop, stream: &'a mut TcpStream, buf: &'a mut [u8]) ->
-    impl Generator<Yield = (), Return = io::Result<usize>> + 'a
+pub fn read_async<'a>(stream: &'a mut TcpStream, buf: &'a mut [u8]) ->
+    impl Generator<Yield = RawFd, Return = io::Result<usize>> + 'a
 {
     move || {
-        handle_would_block!(event_loop, stream.read(buf))
+        handle_would_block!(stream.read(buf))
     }
 }
 
@@ -173,23 +181,27 @@ mod tests {
     fn tcp() {
         thread::spawn(|| {
             let event_loop = EventLoop::new();
-            // TODO: should connect be async?
-            let mut stream = TcpStream::connect("127.0.0.1:8080").expect("stream");
-            stream.set_nonblocking(true).expect("set nonblocking");
-            let mut buffer = vec![0; 4096];
-            await!(event_loop, read_async(&mut stream, &mut buffer))
-                .expect("read");
-            println!("Read: {}", String::from_utf8_lossy(&buffer));
+            event_loop.run(static || {
+                // TODO: should connect be async?
+                let mut stream = TcpStream::connect("127.0.0.1:8080").expect("stream");
+                stream.set_nonblocking(true).expect("set nonblocking");
+                let mut buffer = vec![0; 4096];
+                await!(read_async(&mut stream, &mut buffer))
+                    .expect("read");
+                println!("Read: {}", String::from_utf8_lossy(&buffer));
+            });
         });
 
         thread::spawn(|| {
             let event_loop = EventLoop::new();
-            let mut stream = TcpStream::connect("127.0.0.1:8080").expect("stream");
-            stream.set_nonblocking(true).expect("set nonblocking");
-            let mut buffer = vec![0; 4096];
-            await!(event_loop, read_async(&mut stream, &mut buffer))
-                .expect("read");
-            println!("Read: {}", String::from_utf8_lossy(&buffer));
+            event_loop.run(static || {
+                let mut stream = TcpStream::connect("127.0.0.1:8080").expect("stream");
+                stream.set_nonblocking(true).expect("set nonblocking");
+                let mut buffer = vec![0; 4096];
+                await!(read_async(&mut stream, &mut buffer))
+                    .expect("read");
+                println!("Read: {}", String::from_utf8_lossy(&buffer));
+            });
         });
 
         let event_loop = EventLoop::new();
@@ -209,12 +221,14 @@ mod tests {
             }
             result
         }.expect("accept");*/
-        for i in 0..2 {
-            let (mut client, _address) = await!(event_loop, accept_async(&listener))
-                .expect("accept");
-            let msg = format!("hello {}", i);
-            await!(event_loop, write_async(&mut client, msg.as_bytes()))
-                .expect("write");
-        }
+        event_loop.run(static || {
+            for i in 0..2 {
+                let (mut client, _address) = await!(accept_async(&listener))
+                    .expect("accept");
+                let msg = format!("hello {}", i);
+                await!(write_async(&mut client, msg.as_bytes()))
+                    .expect("write");
+            }
+        });
     }
 }
