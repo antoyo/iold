@@ -20,7 +20,7 @@
  */
 
 /*
- * TODO: Use a Pin to make it safer.
+ * TODO: Use a Pin to make it safer (does not look safer).
  * TODO: Add combinator functions like one to get the first result between two awaitable async
  * calls or collect both results.
  */
@@ -115,7 +115,7 @@ macro_rules! handle_would_block {
             match $object.$func_name($($args),*) {
                 Err(error) => {
                     if error.kind() == WouldBlock {
-                        yield Fd($object.as_raw_fd());
+                        yield Fd($object.as_raw_fd_async());
                     }
                     else {
                         return Err(error);
@@ -156,9 +156,8 @@ impl ReadPipe {
     }
 }
 
-// TODO: Create another trait AsyncFd to avoid being able to use blocking IO by mistake.
-impl AsRawFd for ReadPipe {
-    fn as_raw_fd(&self) -> RawFd {
+impl AsRawFdAsync for ReadPipe {
+    fn as_raw_fd_async(&self) -> RawFd {
         self.fd
     }
 }
@@ -167,8 +166,8 @@ pub struct WritePipe {
     fd: RawFd,
 }
 
-impl AsRawFd for WritePipe {
-    fn as_raw_fd(&self) -> RawFd {
+impl AsRawFdAsync for WritePipe {
+    fn as_raw_fd_async(&self) -> RawFd {
         self.fd
     }
 }
@@ -256,7 +255,7 @@ impl EventLoop {
     pub fn new() -> io::Result<Self> {
         let (read_pipe, write_pipe) = Pipe::new()?;
         PIPE_WRITER_FD.with(|fd| {
-            fd.set(write_pipe.as_raw_fd());
+            fd.set(write_pipe.as_raw_fd_async());
         });
         let fd_set = unsafe { epoll_create1(0) };
         let event_loop = Self {
@@ -266,7 +265,7 @@ impl EventLoop {
             read_pipe,
             tasks: IntMap::new(),
         };
-        event_loop.add_fd(event_loop.read_pipe.as_raw_fd());
+        event_loop.add_fd(event_loop.read_pipe.as_raw_fd_async());
         Ok(event_loop)
     }
 
@@ -319,8 +318,8 @@ impl EventLoop {
                                 GeneratorState::Complete(_) => (),
                             }
                         }
-                        else if current_fd as RawFd == self.read_pipe.as_raw_fd() {
-                            self.add_fd(self.read_pipe.as_raw_fd());
+                        else if current_fd as RawFd == self.read_pipe.as_raw_fd_async() {
+                            self.add_fd(self.read_pipe.as_raw_fd_async());
                         }
                     }
                 },
@@ -358,7 +357,7 @@ impl EventLoop {
             match listener.accept() {
                 Err(error) => {
                     if error.kind() == WouldBlock {
-                        event_loop.add_fd(listener.as_raw_fd());
+                        event_loop.add_fd(listener.as_raw_fd_async());
                         yield;
                     }
                     else {
@@ -408,6 +407,16 @@ impl TcpListener {
     );
 }
 
+trait AsRawFdAsync {
+    fn as_raw_fd_async(&self) -> RawFd;
+}
+
+impl AsRawFdAsync for TcpListener {
+    fn as_raw_fd_async(&self) -> RawFd {
+        self.as_raw_fd()
+    }
+}
+
 pub struct TcpStream {
     stream: net::TcpStream,
 }
@@ -450,6 +459,12 @@ impl TcpStream {
         move || {
             handle_would_block!(self.read(buf))
         }
+    }
+}
+
+impl AsRawFdAsync for TcpStream {
+    fn as_raw_fd_async(&self) -> RawFd {
+        self.as_raw_fd()
     }
 }
 
