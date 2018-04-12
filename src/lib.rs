@@ -35,8 +35,8 @@ use std::io::{
 };
 use std::io::ErrorKind::WouldBlock;
 use std::mem;
-use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::ops::{Generator, GeneratorState};
+use std::net::{self, SocketAddr, ToSocketAddrs};
+use std::ops::{Deref, DerefMut, Generator, GeneratorState};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::raw::{c_int, c_void};
 
@@ -97,8 +97,8 @@ macro_rules! await {
 
 #[macro_export]
 macro_rules! async {
-    (pub fn $func_name:ident ( $($arg_names:ident : $(& $arg_types:ident)*),* ) -> $ret_typ:ty $block:block) => {
-        pub fn $func_name<'a>($($arg_names: $(&'a $arg_types)*),*) ->
+    (pub fn $func_name:ident (& $this:ident $(, $arg_names:ident : $(& $arg_types:ident)*)* ) -> $ret_typ:ty $block:block) => {
+        pub fn $func_name<'a>(&'a $this $(, $arg_names: $(&'a $arg_types)*)*) ->
             impl Generator<Yield = YieldValue, Return = $ret_typ> + 'a
         {
             move || {
@@ -110,7 +110,7 @@ macro_rules! async {
 
 #[macro_export]
 macro_rules! handle_would_block {
-    ($object:ident . $func_name:ident ($($args:expr),*)) => {
+    ($object:ident . $func_name:ident ($($args:expr),*), |$pat:pat| $converter:expr) => {
         loop {
             match $object.$func_name($($args),*) {
                 Err(error) => {
@@ -121,9 +121,15 @@ macro_rules! handle_would_block {
                         return Err(error);
                     }
                 },
-                Ok(result) => return Ok(result),
+                Ok(result) => {
+                    let $pat = result;
+                    return Ok($converter)
+                },
             }
         }
+    };
+    ($object:ident . $func_name:ident ($($args:expr),*)) => {
+        handle_would_block!($object.$func_name($($args),*), |res| res)
     };
 }
 
@@ -365,39 +371,97 @@ impl EventLoop {
     }
 }*/
 
-async!(
-pub fn accept_async(listener: &TcpListener) -> io::Result<(TcpStream, SocketAddr)> {
-    handle_would_block!(listener.accept())
+pub struct TcpListener {
+    listener: net::TcpListener,
 }
-);
 
-pub fn write_async<'a>(stream: &'a mut TcpStream, buf: &'a [u8]) ->
-    impl Generator<Yield = YieldValue, Return = io::Result<usize>> + 'a
-{
-    move || {
-        handle_would_block!(stream.write(buf))
+impl Deref for TcpListener {
+    type Target = net::TcpListener;
+
+    fn deref(&self) -> &Self::Target {
+        &self.listener
     }
 }
 
-pub fn read_async<'a>(stream: &'a mut TcpStream, buf: &'a mut [u8]) ->
-    impl Generator<Yield = YieldValue, Return = io::Result<usize>> + 'a
-{
-    move || {
-        handle_would_block!(stream.read(buf))
+impl DerefMut for TcpListener {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.listener
+    }
+}
+
+impl TcpListener {
+    pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<TcpListener> {
+        let listener = net::TcpListener::bind(addr)?;
+        listener.set_nonblocking(true)?;
+        Ok(Self {
+            listener,
+        })
+    }
+
+    async!(
+    pub fn accept_async(&self) -> io::Result<(TcpStream, SocketAddr)> {
+        handle_would_block!(self.accept(), |(stream, address)| {
+            stream.set_nonblocking(true)?;
+            (TcpStream { stream }, address)
+        })
+    }
+    );
+}
+
+pub struct TcpStream {
+    stream: net::TcpStream,
+}
+
+impl Deref for TcpStream {
+    type Target = net::TcpStream;
+
+    fn deref(&self) -> &Self::Target {
+        &self.stream
+    }
+}
+
+impl DerefMut for TcpStream {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.stream
+    }
+}
+
+impl TcpStream {
+    // TODO: should connect be async?
+    pub fn connect<A: ToSocketAddrs>(addr: A) -> io::Result<Self> {
+        let stream = net::TcpStream::connect(addr)?;
+        stream.set_nonblocking(true).expect("set nonblocking");
+        Ok(Self {
+            stream,
+        })
+    }
+
+    pub fn write_async<'a>(&'a mut self, buf: &'a [u8]) ->
+        impl Generator<Yield = YieldValue, Return = io::Result<usize>> + 'a
+    {
+        move || {
+            handle_would_block!(self.write(buf))
+        }
+    }
+
+    pub fn read_async<'a>(&'a mut self, buf: &'a mut [u8]) ->
+        impl Generator<Yield = YieldValue, Return = io::Result<usize>> + 'a
+    {
+        move || {
+            handle_would_block!(self.read(buf))
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::net::{TcpStream, TcpListener};
     use std::ops::{Generator, GeneratorState};
     use std::thread;
 
     use {
         EventLoop,
-        accept_async,
-        read_async,
-        write_async,
+        TcpListener,
+        TcpStream,
         YieldValue::Task,
     };
 
@@ -406,11 +470,9 @@ mod tests {
         thread::spawn(|| {
             let mut event_loop = EventLoop::new().expect("event loop");
             event_loop.run(static || {
-                // TODO: should connect be async?
                 let mut stream = TcpStream::connect("127.0.0.1:8080").expect("stream");
-                stream.set_nonblocking(true).expect("set nonblocking");
                 let mut buffer = vec![0; 4096];
-                await!(read_async(&mut stream, &mut buffer))
+                await!(stream.read_async(&mut buffer))
                     .expect("read");
                 println!("Read: {}", String::from_utf8_lossy(&buffer));
             })
@@ -421,9 +483,8 @@ mod tests {
             let mut event_loop = EventLoop::new().expect("event loop");
             event_loop.run(static || {
                 let mut stream = TcpStream::connect("127.0.0.1:8080").expect("stream");
-                stream.set_nonblocking(true).expect("set nonblocking");
                 let mut buffer = vec![0; 4096];
-                await!(read_async(&mut stream, &mut buffer))
+                await!(stream.read_async(&mut buffer))
                     .expect("read");
                 println!("Read: {}", String::from_utf8_lossy(&buffer));
             })
@@ -432,7 +493,6 @@ mod tests {
 
         let mut event_loop = EventLoop::new().expect("event loop");
         let listener = TcpListener::bind("127.0.0.1:8080").expect("listener");
-        listener.set_nonblocking(true).expect("set nonblocking");
         /*let (client, _address) = {
             let mut generator = accept_async(&event_loop, &listener);
             let result;
@@ -449,7 +509,7 @@ mod tests {
         }.expect("accept");*/
         event_loop.run(static || {
             for i in 0..2 {
-                let (mut client, _address) = await!(accept_async(&listener))
+                let (mut client, _address) = await!(listener.accept_async())
                     .expect("accept");
                 /*yield Task(Box::new(static move || {
                     let msg = format!("hello {}", i);
@@ -461,7 +521,7 @@ mod tests {
                     .expect("Write async");*/
                 (spawn! {
                     let msg = format!("hello {}", i);
-                    await!(write_async(&mut client, msg.as_bytes()))
+                    await!(client.write_async(msg.as_bytes()))
                         .expect("write");
                 })
                     .expect("spawn");
