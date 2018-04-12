@@ -20,8 +20,9 @@
  */
 
 /*
- * An async function is simply a function that returns a generator (a macro could hide that).
- * Await (could be a macro) is yield and get the value from the event loop after the yield.
+ * TODO: Use a Pin to make it safer.
+ * TODO: Add combinator functions like one to get the first result between two awaitable async
+ * calls or collect both results.
  */
 
 #![feature(generators, generator_trait)]
@@ -61,6 +62,7 @@ pub enum YieldValue {
 const O_NONBLOCK: c_int = 2048;
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct epoll_event {
     pub events: u32,
     pub u64: u64,
@@ -148,6 +150,7 @@ impl ReadPipe {
     }
 }
 
+// TODO: Create another trait AsyncFd to avoid being able to use blocking IO by mistake.
 impl AsRawFd for ReadPipe {
     fn as_raw_fd(&self) -> RawFd {
         self.fd
@@ -269,7 +272,7 @@ impl EventLoop {
         unsafe { epoll_ctl(self.fd_set, EPOLL_CTL_ADD, fd, &mut event) };
     }
 
-    fn add_task(&mut self, mut generator: Box<Generator<Yield = YieldValue, Return = ()>>) {
+    fn add_task(&mut self, mut generator: GenTask) {
         loop {
             match unsafe { generator.resume() } {
                 GeneratorState::Yielded(value) => {
