@@ -42,7 +42,6 @@ use std::os::raw::{c_int, c_void};
 
 use self::YieldValue::{Fd, Task};
 
-// TODO: create a BitSet and use as a key for a Map<BitSet, Generator>.
 const FD_COUNT: usize = 64;
 
 const EPOLL_CTL_ADD: c_int = 1;
@@ -74,18 +73,20 @@ extern "C" {
     fn epoll_ctl(epfd: c_int, op: c_int, fd: c_int, event: *mut epoll_event) -> c_int;
 
     fn pipe2(fds: *mut c_int, flags: c_int) -> c_int;
+    fn read(fd: c_int, buf: *mut c_void, count: usize) -> isize;
     fn write(fd: c_int, buf: *const c_void, count: usize) -> isize;
 }
 
 #[macro_export]
 macro_rules! await {
     ($call:expr) => {{
+        use std::ops::Generator;
         let mut generator = $call;
         let result;
         loop {
             match unsafe { generator.resume() } {
-                GeneratorState::Yielded(fd) => yield fd,
-                GeneratorState::Complete(value) => {
+                ::std::ops::GeneratorState::Yielded(fd) => yield fd,
+                ::std::ops::GeneratorState::Complete(value) => {
                     result = value;
                     break;
                 },
@@ -95,13 +96,32 @@ macro_rules! await {
     }};
 }
 
+// TODO: replace with a proc-macro.
 #[macro_export]
 macro_rules! async {
+    (fn $func_name:ident ($($arg_names:ident : $(& $arg_types:ident)*),* ) -> $ret_typ:ty $block:block) => {
+        fn $func_name<'a>($($arg_names: $(&'a $arg_types)*),*) ->
+            impl ::std::ops::Generator<Yield = $crate::YieldValue, Return = $ret_typ> + 'a
+        {
+            static move || {
+                $block
+            }
+        }
+    };
+    (fn $func_name:ident (&mut $this:ident $(, $arg_names:ident : $(& $arg_types:ident)*)* ) -> $ret_typ:ty $block:block) => {
+        fn $func_name<'a>(&'a mut $this $(, $arg_names: $(&'a $arg_types)*)*) ->
+            impl ::std::ops::Generator<Yield = $crate::YieldValue, Return = $ret_typ> + 'a
+        {
+            static move || {
+                $block
+            }
+        }
+    };
     (pub fn $func_name:ident (& $this:ident $(, $arg_names:ident : $(& $arg_types:ident)*)* ) -> $ret_typ:ty $block:block) => {
         pub fn $func_name<'a>(&'a $this $(, $arg_names: $(&'a $arg_types)*)*) ->
-            impl Generator<Yield = YieldValue, Return = $ret_typ> + 'a
+            impl ::std::ops::Generator<Yield = $crate::YieldValue, Return = $ret_typ> + 'a
         {
-            move || {
+            static move || {
                 $block
             }
         }
@@ -136,7 +156,7 @@ macro_rules! handle_would_block {
 #[macro_export]
 macro_rules! spawn {
     ($($tts:tt)*) => {{
-        yield Task(Box::new(static move || { $($tts)* }));
+        yield $crate::YieldValue::Task(Box::new(static move || { $($tts)* }));
         let write_pipe = $crate::EventLoop::write_pipe();
         await!(write_pipe.write_async(b"0"))
     }};
@@ -152,6 +172,16 @@ impl ReadPipe {
     fn new(fd: RawFd) -> Self {
         Self {
             fd,
+        }
+    }
+
+    fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
+        let result = unsafe { read(self.fd, buf.as_mut_ptr() as *mut _, buf.len()) };
+        if result == -1 {
+            Err(io::Error::last_os_error())
+        }
+        else {
+            Ok(result as usize)
         }
     }
 }
@@ -231,13 +261,8 @@ impl IntMap {
     }
 
     fn insert(&mut self, index: usize, value: GenTask) {
-        let len = self.data.len();
-        if index >= len {
-            let new_len = index + 1;
-            unsafe { self.data.set_len(new_len) };
-            for i in len..new_len {
-                self.data[i] = None;
-            }
+        while self.data.len() <= index {
+            self.data.push(None);
         }
         self.data[index] = Some(value);
     }
@@ -319,6 +344,7 @@ impl EventLoop {
                             }
                         }
                         else if current_fd as RawFd == self.read_pipe.as_raw_fd_async() {
+                            self.read_pipe.read(&mut [0]).expect("read"); // TODO: handle error.
                             self.add_fd(self.read_pipe.as_raw_fd_async());
                         }
                     }
@@ -470,14 +496,12 @@ impl AsRawFdAsync for TcpStream {
 
 #[cfg(test)]
 mod tests {
-    use std::ops::{Generator, GeneratorState};
     use std::thread;
 
     use {
         EventLoop,
         TcpListener,
         TcpStream,
-        YieldValue::Task,
     };
 
     #[test]
